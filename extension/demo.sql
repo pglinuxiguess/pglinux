@@ -1,9 +1,9 @@
 -- Boot the Virtual Machine completely within a PostgreSQL transaction
-SELECT vm_asset_load('firmware', '/path/to/linuxsql/vm/fw_jump.bin');
-SELECT vm_asset_load('kernel', '/path/to/linuxsql/vm/kernel.bin');
-SELECT vm_asset_load('dtb', '/path/to/linuxsql/vm/linuxsql.dtb');
-SELECT vm_asset_load('initrd', '/path/to/linuxsql/vm/initramfs.cpio.gz');
-SELECT vm_asset_load('disk', '/path/to/linuxsql/vm/rootfs.img');
+SELECT vm_asset_load('firmware', :'root' || '/vm/fw_jump.bin');
+SELECT vm_asset_load('kernel', :'root' || '/vm/kernel.bin');
+SELECT vm_asset_load('dtb', :'root' || '/vm/linuxsql.dtb');
+SELECT vm_asset_load('initrd', :'root' || '/vm/initramfs.cpio.gz');
+SELECT vm_asset_load('disk', :'root' || '/vm/rootfs.img');
 SELECT vm_boot();
 
 -- Let the JIT compile and boot Linux! (Native JIT execution)

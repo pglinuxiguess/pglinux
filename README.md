@@ -92,15 +92,17 @@ The included `inception_l3.sql` script leverages the guest's 8GB block-device sn
 
 ```bash
 # Note: Execution time scales exponentially with virtualization depth.
-psql -d linuxsql -f inception_l3.sql
+cd extension/
+psql -d linuxsql -v root="$(pwd)/.." -f inception_l3.sql
 ```
 
 ## Build Instructions
 Execute the following commands to initialize the environment:
 
 ```bash
+cd extension/
 make -f Makefile.vm clean reload
-psql -d linuxsql -f demo.sql
+psql -d linuxsql -v root="$(pwd)/.." -f demo.sql
 ```
 
 This sequence deploys the PostgreSQL extension, seeds the database with the required firmware binaries, and initializes the Virtual Machine hardware assets.

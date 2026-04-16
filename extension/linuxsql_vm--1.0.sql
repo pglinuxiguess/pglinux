@@ -2028,7 +2028,7 @@ AS 'linuxsql_vm', 'rv64_vm_jit_compare' LANGUAGE C;
 -- time and checking if OpenSBI boots past the known failure point.
 -- Returns which opcode(s) fix the boot when disabled.
 
-CREATE FUNCTION vm_jit_bisect_ops(step_budget INT DEFAULT 500000)
+CREATE FUNCTION vm_jit_bisect_ops(root_dir TEXT, step_budget INT DEFAULT 500000)
 RETURNS TABLE(opcode INT, opcode_name TEXT, boot_fixed BOOLEAN, cbytes INT)
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -2051,11 +2051,11 @@ BEGIN
 
         -- Cold-boot fresh FIRST
         PERFORM vm_reset();
-        PERFORM vm_asset_load('firmware', '/path/to/linuxsql/vm/fw_jump.bin');
-        PERFORM vm_asset_load('kernel',   '/path/to/linuxsql/vm/kernel.bin');
-        PERFORM vm_asset_load('dtb',      '/path/to/linuxsql/vm/linuxsql.dtb');
-        PERFORM vm_asset_load('initrd',   '/path/to/linuxsql/vm/initramfs.cpio.gz');
-        PERFORM vm_asset_load('disk',     '/path/to/linuxsql/vm/rootfs.img');
+        PERFORM vm_asset_load('firmware', root_dir || '/vm/fw_jump.bin');
+        PERFORM vm_asset_load('kernel',   root_dir || '/vm/kernel.bin');
+        PERFORM vm_asset_load('dtb',      root_dir || '/vm/linuxsql.dtb');
+        PERFORM vm_asset_load('initrd',   root_dir || '/vm/initramfs.cpio.gz');
+        PERFORM vm_asset_load('disk',     root_dir || '/vm/rootfs.img');
         PERFORM vm_boot();
 
         -- Reset: re-enable all ops
