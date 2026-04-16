@@ -1,0 +1,5 @@
+# linuxsql_vm extension
+comment = 'RISC-V VM emulator with SQL-queryable state'
+default_version = '1.0'
+module_pathname = '$libdir/linuxsql_vm'
+relocatable = true

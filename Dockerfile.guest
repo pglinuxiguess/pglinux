@@ -1,0 +1,442 @@
+# Dockerfile.guest — Cross-compile the RISC-V guest userspace
+#
+# Produces:
+#   /out/initramfs.cpio.gz   — root filesystem (busybox + pg18)
+#   /out/disk.img            — 1GB ext2 data partition
+#
+# Build:
+#   docker build -f Dockerfile.guest -t linuxsql-guest .
+#
+# Extract:
+#   id=$(docker create linuxsql-guest)
+#   docker cp $id:/out/initramfs.cpio.gz vm/initramfs.cpio.gz
+#   docker cp $id:/out/disk.img vm/disk.img
+#   docker rm $id
+
+FROM debian:bookworm AS builder
+
+# ---- Cross-compilation toolchain ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc-riscv64-linux-gnu \
+    g++-riscv64-linux-gnu \
+    wget \
+    ca-certificates \
+    cpio \
+    bison \
+    flex \
+    e2fsprogs \
+    file \
+    bc \
+    libelf-dev \
+    autoconf \
+    automake \
+    autotools-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CROSS=riscv64-linux-gnu-
+ENV CC=${CROSS}gcc
+ENV CXX=${CROSS}g++
+ENV AR=${CROSS}ar
+ENV RANLIB=${CROSS}ranlib
+ENV STRIP=${CROSS}strip
+
+WORKDIR /build
+
+# ---- Stage 1: musl-libc for riscv64 ----
+# We build musl so PG links against a real libc (not glibc cross)
+ARG MUSL_VERSION=1.2.5
+RUN wget -q https://musl.libc.org/releases/musl-${MUSL_VERSION}.tar.gz && \
+    tar xf musl-${MUSL_VERSION}.tar.gz && \
+    cd musl-${MUSL_VERSION} && \
+    ./configure \
+        --host=riscv64-linux-gnu \
+        --prefix=/opt/musl-riscv64 \
+        --disable-shared \
+        CROSS_COMPILE=${CROSS} \
+        CC=${CROSS}gcc && \
+    make -j$(nproc) && \
+    make install && \
+    cd .. && rm -rf musl-*
+
+# Create a musl-gcc wrapper script for the cross compiler
+RUN printf '#!/bin/sh\nexec riscv64-linux-gnu-gcc \
+    -specs /opt/musl-riscv64/lib/musl-gcc.specs \
+    -nostdinc \
+    -isystem /opt/musl-riscv64/include \
+    "$@"\n' > /usr/local/bin/riscv64-musl-gcc && \
+    chmod +x /usr/local/bin/riscv64-musl-gcc
+
+# ---- Stage 2: Custom guest init (replaces BusyBox entirely) ----
+# A single static binary: PID 1 init + POSIX-ish shell + built-in utilities.
+# Must use musl (not glibc) for clean static linking — glibc's static locale
+# support dereferences NULL on a bare initramfs and segfaults.
+COPY guest/init.c /build/guest_init.c
+COPY guest/rv64_test.c /build/rv64_test.c
+RUN /usr/local/bin/riscv64-musl-gcc -static -Os \
+        -o /build/init /build/guest_init.c && \
+    riscv64-linux-gnu-strip /build/init && \
+    file /build/init && ls -la /build/init && \
+    /usr/local/bin/riscv64-musl-gcc -static -O2 -lm \
+        -o /build/rv64_test /build/rv64_test.c && \
+    riscv64-linux-gnu-strip /build/rv64_test && \
+    file /build/rv64_test && ls -la /build/rv64_test
+
+# ---- Stage 2a: dash (POSIX shell for /bin/sh) ----
+# Ubuntu's /bin/sh. Cross-compiled static with musl for RISC-V.
+# Replaces the custom shell parser in init.c for pg_ctl/initdb sh -c calls.
+ARG DASH_VERSION=0.5.12
+RUN wget -q http://gondor.apana.org.au/~herbert/dash/files/dash-${DASH_VERSION}.tar.gz && \
+    tar xf dash-${DASH_VERSION}.tar.gz && \
+    # Pass 1: native build to generate all coded headers
+    cd dash-${DASH_VERSION} && \
+    CC=gcc ./configure && make -j$(nproc) && \
+    # Save generated sources (produced by host-only tools)
+    mkdir -p /tmp/dash_gen && \
+    for f in builtins.c builtins.h init.c nodes.c nodes.h \
+             signames.c syntax.c syntax.h token.h token_vars.h; do \
+        cp src/$f /tmp/dash_gen/; \
+    done && \
+    make distclean && \
+    # Pass 2: cross-configure to get correct config.h for musl/RISC-V
+    CC="/usr/local/bin/riscv64-musl-gcc" \
+    CFLAGS="-Os" \
+    LDFLAGS="-static" \
+    ./configure --host=riscv64-linux-gnu && \
+    # Restore generated sources into the cross-configured tree
+    cp /tmp/dash_gen/* src/ && \
+    # Manual cross-compile — bypasses make's generator rules entirely
+    # Use gcc directly with musl sysroot instead of the wrapper
+    XFLAGS="-static -Os -nostdinc -isystem /opt/musl-riscv64/include -include config.h -I src -I src/bltin" && \
+    DASH_SRCS="alias.c arith_yacc.c arith_yylex.c cd.c error.c eval.c \
+               exec.c expand.c histedit.c input.c jobs.c mail.c main.c \
+               memalloc.c miscbltin.c mystring.c options.c output.c \
+               parser.c redir.c show.c system.c trap.c var.c \
+               builtins.c init.c nodes.c signames.c syntax.c \
+               bltin/printf.c bltin/times.c" && \
+    DASH_OBJS="" && \
+    for f in $DASH_SRCS; do \
+        obj=$(basename $f .c).o; \
+        riscv64-linux-gnu-gcc $XFLAGS -c src/$f -o $obj && \
+        DASH_OBJS="$DASH_OBJS $obj"; \
+    done && \
+    echo "Linking: $DASH_OBJS" && \
+    riscv64-linux-gnu-gcc -static -nostdlib \
+        -L /opt/musl-riscv64/lib \
+        /opt/musl-riscv64/lib/crt1.o \
+        $DASH_OBJS -lc -lgcc \
+        -o dash && \
+    riscv64-linux-gnu-strip dash && \
+    cp dash /build/dash && \
+    file /build/dash && ls -la /build/dash && \
+    cd .. && rm -rf dash-* /tmp/dash_gen
+
+# ---- Stage 2b: Linux kernel 6.1 (with verified CONFIG_MULTIUSER=y) ----
+# The pre-built kernel.bin was missing setuid/setgid syscall support (ENOSYS).
+# Building fresh ensures the syscall table includes setuid (146), setgid (144),
+# setresuid (147), setresgid (149) — all gated on CONFIG_MULTIUSER.
+ARG KERNEL_VERSION=6.1
+RUN wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz && \
+    tar xf linux-${KERNEL_VERSION}.tar.xz && \
+    rm linux-${KERNEL_VERSION}.tar.xz
+
+# Build from tinyconfig (minimal) + enabling just what PostgreSQL needs.
+# defconfig produces a 24MB kernel that boots but init fails to produce output.
+# The original working kernel was ~3.7MB — tinyconfig gets us close.
+RUN cd /build/linux-${KERNEL_VERSION} && \
+    make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- tinyconfig && \
+    # Core: multiuser (setuid), SMP, 64-bit, MMU
+    scripts/config --enable 64BIT && \
+    scripts/config --enable SMP && \
+    scripts/config --enable MMU && \
+    scripts/config --enable MULTIUSER && \
+    scripts/config --enable BINFMT_ELF && \
+    scripts/config --enable BINFMT_SCRIPT && \
+    scripts/config --enable FPU && \
+    scripts/config --enable SYSVIPC && \
+    scripts/config --enable POSIX_MQUEUE && \
+    scripts/config --enable FUTEX && \
+    scripts/config --enable EPOLL && \
+    scripts/config --enable SIGNALFD && \
+    scripts/config --enable TIMERFD && \
+    scripts/config --enable EVENTFD && \
+    scripts/config --enable AIO && \
+    scripts/config --enable ADVISE_SYSCALLS && \
+    scripts/config --enable FHANDLE && \
+    scripts/config --enable POSIX_TIMERS && \
+    # Serial console
+    scripts/config --enable TTY && \
+    scripts/config --enable SERIAL_8250 && \
+    scripts/config --enable SERIAL_8250_CONSOLE && \
+    scripts/config --enable SERIAL_EARLYCON && \
+    scripts/config --enable SERIAL_OF_PLATFORM && \
+    scripts/config --enable PRINTK && \
+    # Device tree
+    scripts/config --enable OF && \
+    scripts/config --enable OF_EARLY_FLATTREE && \
+    # VirtIO block
+    scripts/config --enable BLOCK && \
+    scripts/config --enable VIRTIO_MENU && \
+    scripts/config --enable VIRTIO && \
+    scripts/config --enable VIRTIO_MMIO && \
+    scripts/config --enable VIRTIO_BLK && \
+    # Filesystems
+    scripts/config --enable EXT2_FS && \
+    scripts/config --enable EXT4_FS && \
+    scripts/config --enable PROC_FS && \
+    scripts/config --enable PROC_SYSCTL && \
+    scripts/config --enable SYSFS && \
+    scripts/config --enable TMPFS && \
+    scripts/config --enable DEVTMPFS && \
+    scripts/config --enable DEVTMPFS_MOUNT && \
+    # Initrd
+    scripts/config --enable BLK_DEV_INITRD && \
+    scripts/config --enable RD_GZIP && \
+    # Networking (unix sockets for PG)
+    scripts/config --enable NET && \
+    scripts/config --enable INET && \
+    scripts/config --enable UNIX && \
+    # RISC-V timer
+    scripts/config --enable RISCV_TIMER && \
+    scripts/config --enable RISCV_SBI && \
+    scripts/config --enable IRQCHIP && \
+    scripts/config --enable RISCV_INTC && \
+    scripts/config --enable SIFIVE_PLIC && \
+    scripts/config --enable GENERIC_CLOCKEVENTS && \
+    scripts/config --enable HIGH_RES_TIMERS && \
+    scripts/config --enable RISCV_ISA_C && \
+    scripts/config --set-val HZ 100 && \
+    # Disable security
+    scripts/config --disable SECURITY && \
+    scripts/config --disable AUDIT && \
+    scripts/config --disable COMPAT && \
+    scripts/config --disable MODULES && \
+    # Apply config
+    make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- olddefconfig && \
+    echo "--- Config verification ---" && \
+    grep 'CONFIG_MULTIUSER\|CONFIG_SERIAL_8250\|CONFIG_VIRTIO\|CONFIG_DEVTMPFS\|CONFIG_EXT2\|CONFIG_BLK_DEV_INITRD' .config && \
+    # Build
+    make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j$(nproc) Image && \
+    cp arch/riscv/boot/Image /build/kernel.bin && \
+    ls -lh /build/kernel.bin
+
+# ---- Stage 3: PostgreSQL 18 (static) ----
+# The riscv64 cross-linker (ld from Debian bookworm) segfaults on .so targets.
+# Strategy: build with SHLIB_TARGETS disabled, static archives and bins only.
+ARG PG_VERSION=18.1
+RUN wget -q https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2 && \
+    tar xf postgresql-${PG_VERSION}.tar.bz2
+
+RUN cd /build/postgresql-${PG_VERSION} && \
+    CC="riscv64-linux-gnu-gcc" \
+    CFLAGS="-Os -I/opt/musl-riscv64/include" \
+    LDFLAGS="-static -L/opt/musl-riscv64/lib" \
+    ./configure \
+        --host=riscv64-linux-gnu \
+        --build=aarch64-linux-gnu \
+        --prefix=/opt/pgsql-riscv64 \
+        --without-readline \
+        --without-zlib \
+        --without-icu \
+        --without-openssl \
+        --without-libxml \
+        --without-libxslt \
+        --without-gssapi \
+        --without-ldap \
+        --without-pam \
+        --without-systemd \
+        --without-perl \
+        --without-python \
+        --without-tcl \
+        --disable-thread-safety
+
+# Step 1b: Patch PG to hardcode stack depth limit.
+# Our minimal kernel returns 0 for RLIMIT_STACK in child processes.
+# PG then rejects with "0 kB is outside the valid range for max_stack_depth".
+COPY guest/pg_stack_depth.patch /tmp/pg_stack_depth.patch
+COPY guest/pg_initdb_signal_debug.patch /tmp/pg_initdb_signal_debug.patch
+COPY guest/pg_builtin_ext.c /tmp/pg_builtin_ext.c
+COPY guest/pg_dfmgr_builtin.sh /tmp/pg_dfmgr_builtin.sh
+COPY guest/pg_strdup_diag.patch /tmp/pg_strdup_diag.patch
+RUN cd /build/postgresql-${PG_VERSION} && \
+    patch -p1 < /tmp/pg_stack_depth.patch && \
+    patch -p1 < /tmp/pg_initdb_signal_debug.patch && \
+    sed -i 's/exit_on_error=true -c log_checkpoints=false/exit_on_error=true -c log_checkpoints=false -c log_error_verbosity=verbose/' src/bin/initdb/initdb.c && \
+    sed -i "s/if (prorows < 0)/if (isnan(prorows)) prorows = -1; if (prorows < 0)/" src/backend/commands/functioncmds.c && \
+    sed -i 's/100, 100, MAX_KILOBYTES,/2048, 0, MAX_KILOBYTES,/' src/backend/utils/misc/guc_tables.c && \
+    grep '2048, 0, MAX_KILOBYTES' src/backend/utils/misc/guc_tables.c && \
+    cp /tmp/pg_builtin_ext.c src/backend/utils/fmgr/pg_builtin_ext.c && \
+    sh /tmp/pg_dfmgr_builtin.sh /build/postgresql-${PG_VERSION} && \
+    # Patch pg_strdup: print the return address when NULL is passed
+    patch -p1 < /tmp/pg_strdup_diag.patch && \
+    echo "=== PG patches applied ==="
+
+# Step 2: Fix static link order + let .so failures pass
+# - Wrap lib flags with --start-group/--end-group for circular deps
+# - The .so link will segfault, but -k lets the .a and binary builds continue
+RUN cd /build/postgresql-${PG_VERSION} && \
+    sed -i '/^LIBS = /s/$/ -Wl,--end-group/' src/Makefile.global && \
+    sed -i '/^LDFLAGS_EX = /s/$/ -Wl,--start-group/' src/Makefile.global && \
+    echo "=== Makefile.global patched ===" && \
+    grep 'LIBS = ' src/Makefile.global && \
+    grep 'LDFLAGS_EX = ' src/Makefile.global
+
+# Step 3: Build everything with -k (keep going past .so failures)
+RUN cd /build/postgresql-${PG_VERSION} && \
+    make -j$(nproc) -k 2>&1; \
+    echo "=== make -k pass done ===" && \
+    # Verify plpgsql .o files were built
+    ls src/pl/plpgsql/src/*.o && \
+    echo "=== plpgsql objects built ==="
+
+# Step 3b: Re-link client binaries with --start-group to fix circular deps.
+# The .o files are built, just the final link fails due to libpq ↔ libpgcommon ordering.
+RUN cd /build/postgresql-${PG_VERSION} && \
+    echo "=== Creating encoding shim ===" && \
+    printf 'extern int pg_char_to_encoding_private(const char *n);\n' > /tmp/encshim.c && \
+    printf 'extern const char *pg_encoding_to_char_private(int e);\n' >> /tmp/encshim.c && \
+    printf 'extern int pg_valid_server_encoding_private(const char *n);\n' >> /tmp/encshim.c && \
+    printf 'extern int pg_valid_server_encoding_id_private(int e);\n' >> /tmp/encshim.c && \
+    printf 'extern int pg_utf_mblen_private(const unsigned char *s);\n' >> /tmp/encshim.c && \
+    printf 'int pg_char_to_encoding(const char *n){return pg_char_to_encoding_private(n);}\n' >> /tmp/encshim.c && \
+    printf 'const char *pg_encoding_to_char(int e){return pg_encoding_to_char_private(e);}\n' >> /tmp/encshim.c && \
+    printf 'int pg_valid_server_encoding(const char *n){return pg_valid_server_encoding_private(n);}\n' >> /tmp/encshim.c && \
+    printf 'int pg_valid_server_encoding_id(int e){return pg_valid_server_encoding_id_private(e);}\n' >> /tmp/encshim.c && \
+    printf 'int pg_utf_mblen(const unsigned char *s){return pg_utf_mblen_private(s);}\n' >> /tmp/encshim.c && \
+    riscv64-linux-gnu-gcc -c -Os /tmp/encshim.c -o /tmp/encshim.o && \
+    COMMON_LIBS="-lpgfeutils -lpq -lpgcommon -lpgport -lm" && \
+    LIB_DIRS="-L src/port -L src/common -L src/fe_utils -L src/interfaces/libpq" && \
+    CFLAGS="-static -L/opt/musl-riscv64/lib" && \
+    # initdb
+    riscv64-linux-gnu-gcc $CFLAGS \
+        src/bin/initdb/findtimezone.o src/bin/initdb/initdb.o src/bin/initdb/localtime.o \
+        /tmp/encshim.o $LIB_DIRS $COMMON_LIBS -o src/bin/initdb/initdb && \
+    echo "initdb linked" && \
+    # psql
+    riscv64-linux-gnu-gcc $CFLAGS \
+        src/bin/psql/*.o \
+        /tmp/encshim.o $LIB_DIRS $COMMON_LIBS -o src/bin/psql/psql && \
+    echo "psql linked" && \
+    # pg_ctl
+    riscv64-linux-gnu-gcc $CFLAGS \
+        src/bin/pg_ctl/pg_ctl.o \
+        /tmp/encshim.o $LIB_DIRS $COMMON_LIBS -o src/bin/pg_ctl/pg_ctl && \
+    echo "pg_ctl linked" && \
+    # Verify
+    file src/bin/initdb/initdb && \
+    file src/bin/psql/psql && \
+    file src/bin/pg_ctl/pg_ctl
+
+# Step 3c: Re-link postgres with PL/pgSQL built-in
+# The make -k compiled plpgsql .o files but couldn't link the .so.
+# We compile the builtin registry, add it to the fmgr subdirectory's
+# objfiles.txt (where expand_subsys finds it), add plpgsql objects
+# via LOCALOBJS, and re-link.
+RUN cd /build/postgresql-${PG_VERSION} && \
+    # Compile the builtin extension registry
+    riscv64-linux-gnu-gcc -c -Os \
+        -I src/include \
+        src/backend/utils/fmgr/pg_builtin_ext.c \
+        -o src/backend/utils/fmgr/pg_builtin_ext.o && \
+    echo "builtin_ext.o compiled" && \
+    # Add to the fmgr SUBDIRECTORY objfiles.txt (expand_subsys reads these)
+    # Format: full subdir path, matching common.mk's $(addprefix $(subdir)/,$(OBJS))
+    echo "src/backend/utils/fmgr/pg_builtin_ext.o" >> src/backend/utils/fmgr/objfiles.txt && \
+    # Add plpgsql objects as LOCALOBJS — insert BEFORE 'OBJS =' (outside dtrace conditional)
+    sed -i '/^OBJS = /i LOCALOBJS += ../pl/plpgsql/src/pl_comp.o ../pl/plpgsql/src/pl_exec.o ../pl/plpgsql/src/pl_funcs.o ../pl/plpgsql/src/pl_gram.o ../pl/plpgsql/src/pl_handler.o ../pl/plpgsql/src/pl_scanner.o' src/backend/Makefile && \
+    # Force re-link by removing old binary
+    rm -f src/backend/postgres && \
+    # Re-link using make (inherits correct CFLAGS/LDFLAGS/LIBS)
+    make -C src/backend postgres 2>&1 | tail -10 && \
+    file src/backend/postgres && \
+    echo "=== postgres re-linked with plpgsql ==="
+
+# Step 4: Install
+RUN cd /build/postgresql-${PG_VERSION} && \
+    # Touch fake .so files so make install doesn't re-trigger broken links
+    touch src/interfaces/libpq/libpq.so.5.18 && \
+    ln -sf libpq.so.5.18 src/interfaces/libpq/libpq.so 2>/dev/null || true && \
+    make install -k 2>&1 | tail -10; \
+    echo "=== Installed ===" && \
+    ls -la /opt/pgsql-riscv64/bin/ && \
+    riscv64-linux-gnu-strip /opt/pgsql-riscv64/bin/* 2>/dev/null || true
+
+# Ensure postgresql.conf.sample is installed (make install -k may skip it)
+RUN cd /build/postgresql-${PG_VERSION} && \
+    cp src/backend/utils/misc/postgresql.conf.sample /opt/pgsql-riscv64/share/ 2>/dev/null || \
+    echo "# Minimal postgresql.conf.sample for initdb" > /opt/pgsql-riscv64/share/postgresql.conf.sample && \
+    ls -la /opt/pgsql-riscv64/share/postgresql.conf.sample
+
+# Cleanup PG source
+RUN rm -rf /build/postgresql-*
+
+# Verify we got riscv64 binaries
+RUN file /opt/pgsql-riscv64/bin/postgres && \
+    file /opt/pgsql-riscv64/bin/initdb && \
+    file /opt/pgsql-riscv64/bin/psql && \
+    file /opt/pgsql-riscv64/bin/pg_ctl && \
+    file /build/init
+
+# ---- Stage 4: Assemble initramfs ----
+# Our custom init binary replaces busybox (init + shell + cat/ls/grep/etc.)
+RUN mkdir -p /rootfs/dev /rootfs/proc /rootfs/sys /rootfs/tmp \
+             /rootfs/etc /rootfs/root /rootfs/data /rootfs/bin \
+             /rootfs/usr/local/pgsql/bin /rootfs/usr/local/pgsql/lib \
+             /rootfs/usr/local/pgsql/share /out && \
+    # Custom init — this IS /init (kernel rdinit entry point)
+    cp /build/init /rootfs/init && \
+    # RISC-V test suite — runs before initdb to validate the environment
+    cp /build/rv64_test /rootfs/bin/rv64_test && \
+    # dash: real POSIX shell for popen/system/pg_ctl sh -c calls
+    cp /build/dash /rootfs/bin/dash && \
+    ln -sf dash /rootfs/bin/sh && \
+    # PostgreSQL binaries
+    cp /opt/pgsql-riscv64/bin/postgres /rootfs/usr/local/pgsql/bin/ && \
+    cp /opt/pgsql-riscv64/bin/initdb  /rootfs/usr/local/pgsql/bin/ && \
+    cp /opt/pgsql-riscv64/bin/psql    /rootfs/usr/local/pgsql/bin/ && \
+    cp /opt/pgsql-riscv64/bin/pg_ctl  /rootfs/usr/local/pgsql/bin/ && \
+    # PG share directory (needed by initdb for timezone, SQL catalogs)
+    cp -a /opt/pgsql-riscv64/share/* /rootfs/usr/local/pgsql/share/ && \
+    # Stub snowball text search — dict_snowball.so not available in static build
+    echo '-- snowball disabled (static build)' > /rootfs/usr/local/pgsql/share/snowball_create.sql && \
+    # PG lib (internal libs if any)
+    cp -a /opt/pgsql-riscv64/lib/* /rootfs/usr/local/pgsql/lib/ 2>/dev/null || true
+
+# Minimal /etc files (init.c handles most setup, but PG reads passwd/group)
+RUN echo "root:x:0:0:root:/root:/bin/dash" > /rootfs/etc/passwd && \
+    echo "root:x:0:" > /rootfs/etc/group && \
+    echo "postgres:x:70:70:PostgreSQL:/data:/bin/dash" >> /rootfs/etc/passwd && \
+    echo "postgres:x:70:" >> /rootfs/etc/group && \
+    echo "linuxsql-vm" > /rootfs/etc/hostname && \
+    echo "127.0.0.1 localhost" > /rootfs/etc/hosts && \
+    echo "nameserver 10.0.2.3" > /rootfs/etc/resolv.conf
+
+# Shell profile — sets prompt for vm_exec sentinel detection and PATH for PG bins
+RUN printf 'export PS1="linuxsql# "\nexport PATH=/usr/local/pgsql/bin:/bin:/usr/bin\nexport PAGER=cat\n' > /rootfs/etc/profile
+
+# ---- Build the initramfs cpio ----
+# The kernel's cpio extractor truncates after ~640 entries, so strip
+# non-essential files (timezone data is 600+ entries alone).
+# Keep only UTC timezone for initdb's fallback. Keep timezonesets (postgres needs it).
+RUN cd /rootfs && \
+    find usr/local/pgsql/share/timezone -mindepth 1 ! -name UTC ! -name Etc -delete 2>/dev/null; \
+    echo "share file count: $(find usr/local/pgsql/share -type f | wc -l)" && \
+    echo "total file count: $(find . | wc -l)" && \
+    find . | sort | cpio -o -H newc | gzip -9 > /out/initramfs.cpio.gz
+
+# ---- Build the 128MB disk image ----
+RUN dd if=/dev/zero of=/out/disk.img bs=1M count=128 && \
+    mkfs.ext2 -L rootfs -F /out/disk.img
+
+# ---- Copy kernel binary to output ----
+RUN cp /build/kernel.bin /out/kernel.bin
+
+# ---- Summary ----
+RUN echo "=== Build complete ===" && \
+    ls -lh /out/ && \
+    echo "=== initramfs contents ===" && \
+    find /rootfs -type f | sort && \
+    file /rootfs/init && \
+    file /rootfs/usr/local/pgsql/bin/postgres && \
+    du -sh /rootfs/
+

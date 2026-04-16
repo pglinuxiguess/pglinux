@@ -1,0 +1,6 @@
+# linuxsql extension
+comment = 'Linux kernel running inside PostgreSQL'
+default_version = '1.0'
+module_pathname = '$libdir/linuxsql'
+relocatable = false
+schema = linux

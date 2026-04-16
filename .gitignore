@@ -1,0 +1,129 @@
+# macOS 
+.DS_Store
+__MACOSX/
+
+# Object files & Libraries
+*.o
+*.so
+*.dylib
+*.a
+*.cmd
+
+# Temporary / System Extraction Directories
+tmp/
+initramfs/
+vm/_*/
+vm/mnt/
+vm/pgsql/
+vm/snapshots/
+vm/rootfs_patch/
+vm/check_initramfs/
+extension/archived_files/
+
+# The massive Ext4 / Linux Source Trees
+linux-src/
+vm/pg18.tar.bz2
+
+# Extracted OS binaries / debug dumps
+vm/*.img
+vm/*.img.bak
+vm/init
+vm/System.map
+vm/dash
+vm/postgres_wrapper
+vm/rv64_test
+vm/initdb.asm
+vm/*.txt
+
+# Ignore specific VM environment test binaries
+vm/initdb.elf
+
+# Guest test binaries
+guest/fp_probe
+guest/*.dis
+guest/rv64_test_new
+
+# --- AGGRESSIVE DEBUG EXCLUSIONS ---
+# Execution logs
+*.log
+*.txt
+
+# Python debug scripts in extension
+extension/*.py
+parse_map.py
+
+# Bash wrapper debugs in extension
+extension/*.sh
+vm_run.sh
+
+# Patch fragments
+*.patch
+*.orig
+*.rej
+*.bak
+
+# Compiled debug executables in extension (no extensions)
+# We ignore anything starting with rv64_ that doesn't have an extension, 
+# but allow the actual directory contents otherwise.
+extension/check_struct
+extension/get_offsets
+extension/offset
+extension/rv64_30pc
+extension/rv64_boot
+extension/rv64_boot2
+extension/rv64_boot_test
+extension/rv64_call_trace
+extension/rv64_clk_trace
+extension/rv64_crash_debug
+extension/rv64_debug
+extension/rv64_diag
+extension/rv64_diag2
+extension/rv64_entry_trace
+extension/rv64_finaltrace
+extension/rv64_finaltrace2
+extension/rv64_irq_trace
+extension/rv64_jalr_trace
+extension/rv64_ktrace
+extension/rv64_longrun
+extension/rv64_memwatch
+extension/rv64_mmu_debug
+extension/rv64_mmu_trace
+extension/rv64_mmutrace2
+extension/rv64_ptwalk
+extension/rv64_ptwalk2
+extension/rv64_quick_check
+extension/rv64_range_check
+extension/rv64_satp
+extension/rv64_satp_debug
+extension/rv64_sd_trace
+extension/rv64_stack
+extension/rv64_stack_check
+extension/rv64_stack_monitor
+extension/rv64_test
+extension/rv64_timer_debug
+extension/rv64_trace
+extension/rv64_trace2
+extension/rv64_trace3
+extension/rv64_trap_trace
+extension/rv64_watchpoint
+extension/test_shift
+
+# Test SQL/Makefiles
+extension/Makefile.test*
+extension/bisect_test.sql
+extension/compare.sql
+extension/flamegraph.sql
+extension/load_assets.sql
+extension/run.sql
+extension/run_long.sql
+extension/test_*.sql
+extension/tests/
+
+# Bin dumps
+extension/*.bin
+extension/*.hex
+extension/a.out
+
+# Deprecated/Old VMs
+vm/build-*.sh
+vm/test_*.c

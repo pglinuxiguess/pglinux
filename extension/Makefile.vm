@@ -1,0 +1,90 @@
+# Makefile.vm — Build the linuxsql_vm PostgreSQL extension
+#
+# Pure RISC-V emulator as a PG extension. No kernel linkage needed.
+
+EXTENSION = linuxsql_vm
+MODULE_big = linuxsql_vm
+OBJS = rv64_pgext.o rv64_cpu.o rv64_bus.o rv64_mmu.o rv64_fpu.o rv64_virtio.o rv64_virtio_net.o rv64_sljit.o sljit_src/sljitLir.o
+
+# Explicit header dependencies to prevent ABI mismatch and pointer obliteration natively
+rv64_pgext.o: rv64_cpu.h rv64_virtio.h rv64_jit.h
+rv64_cpu.o: rv64_cpu.h rv64_virtio.h rv64_jit.h
+rv64_virtio.o: rv64_virtio.h rv64_cpu.h
+rv64_virtio_net.o: rv64_virtio.h rv64_cpu.h
+rv64_fpu.o rv64_mmu.o rv64_bus.o: rv64_cpu.h
+rv64_sljit.o: rv64_jit.h
+
+DATA = linuxsql_vm--1.0.sql
+
+# PG_CPPFLAGS: add -I for the header, slirp, and glib
+CFLAGS_SLIRP = $(shell /opt/homebrew/bin/pkg-config --cflags slirp glib-2.0 2>/dev/null || echo "-I/opt/homebrew/include/slirp -I/opt/homebrew/include/glib-2.0 -I/opt/homebrew/lib/glib-2.0/include")
+LIBS_SLIRP = $(shell /opt/homebrew/bin/pkg-config --libs slirp glib-2.0 2>/dev/null || echo "-L/opt/homebrew/lib -lslirp -lglib-2.0")
+
+PG_CPPFLAGS = -I$(CURDIR) $(CFLAGS_SLIRP) -DHAVE_LIBSLIRP=1 -Wno-deprecated-declarations
+PG_CFLAGS = -O2
+ifeq ($(shell uname -s),Darwin)
+    PG_CFLAGS += -march=native
+endif
+PG_LDFLAGS = 
+SHLIB_LINK = -lm $(LIBS_SLIRP)
+
+PG_CONFIG_SYSTEM := $(shell command -v pg_config 2>/dev/null)
+ifeq ($(PG_CONFIG_SYSTEM),)
+	PG_CONFIG ?= /opt/homebrew/opt/postgresql@18/bin/pg_config
+else
+	PG_CONFIG ?= $(PG_CONFIG_SYSTEM)
+endif
+
+PGXS := $(shell $(PG_CONFIG) --pgxs)
+include $(PGXS)
+
+# ---- Dev workflow targets ----
+# Derive psql path from PG_CONFIG so we never lose it
+PSQL := $(dir $(PG_CONFIG))psql
+DB   := linuxsql
+
+# VM boot args (relative to repo root)
+VM_DIR  := $(CURDIR)/../vm
+FW      := $(VM_DIR)/fw_jump.bin
+KERN    := $(VM_DIR)/kernel.bin
+DTB     := $(VM_DIR)/linuxsql.dtb
+INITRD  := $(VM_DIR)/initramfs.cpio.gz
+ROOTFS  := $(VM_DIR)/rootfs.img
+
+.PHONY: reload boot test rebuild-vm psql-check
+
+## reload: rebuild .so, drop/recreate extension in postgres
+reload: install
+	@echo "=== Reloading extension in $(DB) ==="
+	$(PSQL) -d $(DB) -c " \
+		DROP EXTENSION IF EXISTS linuxsql_vm CASCADE; \
+		CREATE EXTENSION linuxsql_vm; \
+		SELECT 'linuxsql_vm extension loaded' AS status;" 2>&1
+	@echo "=== Done ==="
+
+## boot: reload extension then boot VM to shell prompt
+boot: reload
+	@echo "=== Seeding VM assets into database ==="
+	$(PSQL) -d $(DB) -c "SELECT vm_asset_load('firmware', '$(FW)');"
+	$(PSQL) -d $(DB) -c "SELECT vm_asset_load('kernel', '$(KERN)');"
+	$(PSQL) -d $(DB) -c "SELECT vm_asset_load('dtb', '$(DTB)');"
+	$(PSQL) -d $(DB) -c "SELECT vm_asset_load('initrd', '$(INITRD)');"
+	$(PSQL) -d $(DB) -c "SELECT vm_asset_load('disk', '$(ROOTFS)');"
+	@echo "=== Booting VM ==="
+	$(PSQL) -d $(DB) -c " \
+		SELECT vm_boot(); \
+		SELECT * FROM vm_step_until('linuxsql#', 5000000000);"
+
+## test: boot then run test suite
+test: boot
+	$(PSQL) -d $(DB) -c "SELECT * FROM vm_test_suite();"
+
+## rebuild-vm: full clean rebuild + reload
+rebuild-vm: clean install reload
+	@echo "=== Rebuild complete ==="
+
+## shell: open interactive psql with the right PATH
+shell:
+	@echo "--- linuxsql_vm dev shell ---"
+	@echo "JIT: $$(grep '#if [01].*JIT' $(CURDIR)/rv64_cpu.c | head -1)"
+	$(PSQL) -d $(DB)
